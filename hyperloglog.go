@@ -16,6 +16,7 @@ import (
 	"encoding/gob"
 	"errors"
 	"math"
+	"sync/atomic"
 )
 
 const two32 = 1 << 32
@@ -24,6 +25,8 @@ type HyperLogLog struct {
 	reg []uint8
 	m   uint32
 	p   uint8
+	c   uint64
+	z   uint16
 }
 
 // New returns a new initialized HyperLogLog.
@@ -35,6 +38,8 @@ func New(precision uint8) (*HyperLogLog, error) {
 	h := &HyperLogLog{}
 	h.p = precision
 	h.m = 1 << precision
+	h.z = uint16(h.m)
+	h.c = 0
 	h.reg = make([]uint8, h.m)
 	return h, nil
 }
@@ -42,6 +47,8 @@ func New(precision uint8) (*HyperLogLog, error) {
 // Clear sets HyperLogLog h back to its initial state.
 func (h *HyperLogLog) Clear() {
 	h.reg = make([]uint8, h.m)
+	h.z = uint16(h.m)
+	atomic.StoreUint64(&h.c, 0)
 }
 
 // Add adds a new item to HyperLogLog h.
@@ -52,7 +59,12 @@ func (h *HyperLogLog) Add(item Hash32) {
 
 	zeroBits := clz32(w) + 1
 	if zeroBits > h.reg[i] {
+		if h.reg[i] == 0 {
+			h.z--
+		}
 		h.reg[i] = zeroBits
+		est := h.doCount()
+		atomic.StoreUint64(&h.c, est)
 	}
 }
 
@@ -67,14 +79,21 @@ func (h *HyperLogLog) Merge(other *HyperLogLog) error {
 			h.reg[i] = v
 		}
 	}
+	h.z = uint16(countZeros(h.reg))
+	est := h.doCount()
+	atomic.StoreUint64(&h.c, est)
 	return nil
 }
 
-// Count returns the cardinality estimate.
 func (h *HyperLogLog) Count() uint64 {
+	return atomic.LoadUint64(&h.c)
+}
+
+// Count returns the cardinality estimate.
+func (h *HyperLogLog) doCount() uint64 {
 	est := calculateEstimate(h.reg)
 	if est <= float64(h.m)*2.5 {
-		if v := countZeros(h.reg); v != 0 {
+		if v := uint32(h.z); v != 0 {
 			return uint64(linearCounting(h.m, v))
 		}
 		return uint64(est)
@@ -97,6 +116,12 @@ func (h *HyperLogLog) GobEncode() ([]byte, error) {
 	if err := enc.Encode(h.p); err != nil {
 		return nil, err
 	}
+	if err := enc.Encode(h.c); err != nil {
+		return nil, err
+	}
+	if err := enc.Encode(h.z); err != nil {
+		return nil, err
+	}
 	return buf.Bytes(), nil
 }
 
@@ -110,6 +135,12 @@ func (h *HyperLogLog) GobDecode(b []byte) error {
 		return err
 	}
 	if err := dec.Decode(&h.p); err != nil {
+		return err
+	}
+	if err := dec.Decode(&h.c); err != nil {
+		return err
+	}
+	if err := dec.Decode(&h.z); err != nil {
 		return err
 	}
 	return nil
